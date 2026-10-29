@@ -7,3 +7,6 @@ __pycache__/
 *.nam
 *.wav
 .DS_Store
+.venv/
+.pytest_cache/
+!tools/ramboot/*.bin

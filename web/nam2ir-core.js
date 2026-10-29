@@ -3,9 +3,9 @@
 // in Node (module.exports) for the check against the Python tool.
 //
 // The .wav is 2,048 samples, 48 kHz, mono, 32-bit float: a header (0.5, -0.5,
-// 3.0, a scale 2^e, 1871 / 1024, 0, 0, 0), then the capture's 1,871 weights
-// in the order the kernel loads them, divided by 2^e so that every sample is
-// within HX Edit's +-15.8 limit, then zeros.
+// 3.0, a scale 2^e, 1871 / 1024, the input level, 0, 0), then the capture's 1,871 weights
+// in the order the kernel loads them, then their silence state (72 words), all
+// divided by 2^e so that every sample is within HX Edit's +-15.8 limit, then zeros.
 (function (root) {
   "use strict";
 
@@ -16,6 +16,7 @@
   var KERNEL = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 15, 15, 6, 6, 6, 6, 6, 6, 6];
   var DILATION = [1, 3, 7, 17, 41, 101, 239, 1, 3, 7, 17, 41, 101, 239, 1, 13, 1, 3, 7, 17, 41, 101, 239];
   var N_WEIGHTS = 1871;
+  var STOMP_DBU = 11.5;             // the Stomp's input at 0 dBFS, the firmware's: tools/sharc/nam_lite.py
 
   function same(a, b) {
     return Array.isArray(a) && a.length === b.length && a.every(function (x, i) { return x === b[i]; });
@@ -67,6 +68,21 @@
     return out;
   }
 
+  // The capture's input level in dBu (metadata input_level_dbu), or null when
+  // the file does not give a number: tools/sharc/nam_pack.py input_level_dbu().
+  function inputLevelDbu(meta) {
+    var dbu = meta && meta.input_level_dbu;
+    return typeof dbu === "number" && isFinite(dbu) ? dbu : null;
+  }
+
+  // IR word 5: tools/sharc/nam_lite.py level_word().
+  function levelWord(dbu) {
+    if (dbu === null) return 0;
+    var g = Math.fround(Math.pow(10, -dbu / 20));
+    if (!(g > 0 && g < IR_LIMIT)) throw new Error("Input level " + dbu + " dBu is out of range (above -24 dBu).");
+    return g;
+  }
+
   // tools/sharc/nam_lite.py layer_weights(): per layer bias and mix-in per
   // output channel, the taps [tap][input][output], then per output channel
   // bias1 and its 1x1 weights; the head (bias, then [tap][channel]); the
@@ -93,22 +109,53 @@
     return { blocks: blocks, head: head, rech: w.slice(0, C), scale: w[o + C * HEAD_TAPS + 1] };
   }
 
+  // tools/sharc/nam_lite.py silence(): what the rings hold after silence, in
+  // float32 op for op as the kernel adds: the head's input (3) and each layer's
+  // input x (23 x 3). A change of model fills the rings with it, so it does not pop.
+  function silence(w) {
+    var f = Math.fround;
+    var lw = layerWeights(w.map(f));
+    var x = lw.rech.map(function (r) { return f(r * 0); });
+    var hs = [0, 0, 0], xs = [];
+    KERNEL.forEach(function (k, n) {
+      var blk = lw.blocks[n], a = [], i, j, t;
+      xs.push(x.slice());
+      for (i = 0; i < C; i++) {
+        var v = f(f(blk[2 * i] + f(blk[2 * i + 1] * 0)) + 0);
+        for (t = 0; t < k; t++) for (j = 0; j < C; j++) v = f(v + f(blk[2 * C + (t * C + j) * C + i] * x[j]));
+        a.push(Math.max(v, f(v * f(0.01))));
+      }
+      hs = hs.map(function (h, i) { return f(h + a[i]); });
+      var o = 2 * C + k * C * C;
+      for (i = 0; i < C; i++) {
+        var u = blk[o + 4 * i];
+        for (j = 0; j < C; j++) u = f(u + f(a[j] * blk[o + 4 * i + 1 + j]));
+        x[i] = f(x[i] + u);
+      }
+    });
+    return { hs: hs, xs: xs };
+  }
+
+  // The words a model loads as: the 1,871 weights, then its silence state
+  // (72 words, each / 16, as the kernel keeps them).
   function stream(w) {
     var lw = layerWeights(w);
     var out = lw.rech.concat(lw.head, [lw.scale]);
     lw.blocks.forEach(function (b) { out = out.concat(b); });
-    return out;
+    var s = silence(w);
+    s.xs.forEach(function (x) { s.hs = s.hs.concat(x); });
+    return out.concat(s.hs.map(function (v) { return v / 16; }));
   }
 
   // The 2,048 IR samples as a Float32Array, and the scale exponent.
-  function irSamples(w) {
+  function irSamples(w, dbu) {
     var st = stream(w);
     var peak = 0;
     st.forEach(function (x) { peak = Math.max(peak, Math.abs(x)); });
     var e = 0;
     while (peak / Math.pow(2, e) > 15.5) e++;
     var s = Math.pow(2, e);
-    var vals = [0.5, -0.5, C, s, st.length / 1024, 0, 0, 0].concat(st.map(function (x) { return x / s; }));
+    var vals = [0.5, -0.5, C, s, N_WEIGHTS / 1024, levelWord(dbu === undefined ? null : dbu), 0, 0].concat(st.map(function (x) { return x / s; }));
     if (vals.length >= IR_SAMPLES) throw new Error("Too many weights for one IR slot.");
     vals.forEach(function (v) {
       if (!(Math.abs(v) < IR_LIMIT)) throw new Error("A sample HX Edit would refuse (" + v + ").");
@@ -138,15 +185,18 @@
     return model.toLowerCase().indexOf(make.toLowerCase()) === 0 ? model : make + " " + model;
   }
 
-  // Text of a .nam file -> { wav, info } or an Error thrown.
-  function convert(text) {
+  // Text of a .nam file -> { wav, info } or an Error thrown. opts: level: false
+  // to leave the input level out (word 5 0: no trim).
+  function convert(text, opts) {
+    opts = opts || {};
     var d;
     try { d = JSON.parse(text); } catch (err) { throw new Error("The file is not valid JSON, so not a .nam file."); }
     var pick = pickModel(d);
     var bad = problems(pick.model);
     if (bad.length) throw new Error("Not an A2 Lite capture the kernel can run: " + bad.join("; ") + ".");
-    var ir = irSamples(pick.model.weights);
     var meta = d.metadata || {};
+    var dbu = opts.level === false ? null : inputLevelDbu(meta);
+    var ir = irSamples(pick.model.weights, dbu);
     var rate = pick.model.sample_rate || d.sample_rate;
     return {
       wav: wavBytes(ir.samples),
@@ -157,13 +207,15 @@
         slimmable: pick.slimmable,
         exponent: ir.exponent,
         peak: ir.peak,
+        inputDbu: dbu,
+        trimDb: dbu === null ? null : STOMP_DBU - dbu,
         sampleRate: rate,
         warnings: rate && rate !== 48000 ? ["Trained at " + rate + " Hz; the Stomp runs at 48 kHz, so it will sound off."] : []
       }
     };
   }
 
-  var api = { convert: convert, pickModel: pickModel, problems: problems, irSamples: irSamples, wavBytes: wavBytes };
+  var api = { STOMP_DBU: STOMP_DBU, convert: convert, pickModel: pickModel, problems: problems, irSamples: irSamples, wavBytes: wavBytes };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.NAM2IR = api;
 })(this);

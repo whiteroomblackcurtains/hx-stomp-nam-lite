@@ -9,6 +9,7 @@ kernel reads them, then the zeroed rings; tools/sharc/nam_lite.py uses its
 loader and layer order.
 """
 import json
+import math
 import re
 import struct
 import sys
@@ -37,6 +38,17 @@ def load(path, channels=3):
             return m["weights"], channels
     raise SystemExit(f"no {channels}-channel WaveNet in {path}")
 
+
+
+def input_level_dbu(path):
+    """The capture's input level in dBu (its interface's dBu at 0 dBFS, metadata
+    input_level_dbu) of a .nam file, or None when it does not give a number (as
+    web/nam2ir-core.js)."""
+    if not path.endswith(".nam"):
+        return None
+    dbu = (json.load(open(path)).get("metadata") or {}).get("input_level_dbu")
+    ok = isinstance(dbu, (int, float)) and not isinstance(dbu, bool) and math.isfinite(dbu)
+    return float(dbu) if ok else None
 
 def _layers(w, c, simd):
     """Weight stream -> (per-layer blocks in the kernel's order, head, head bias, scale)."""
